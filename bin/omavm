@@ -126,6 +126,17 @@ Desktop in the guest:
   qs <args...>         Run quickshell CLI against the running shell, e.g.
                          omavm qs ipc call your-name.text-transform open
   restart-shell        Restart omarchy-shell in the guest.
+  resolution <WxH> [scale]
+                       Set the guest's resolution and resize the QEMU window
+                       to match, so the guest renders pixel for pixel instead
+                       of being squeezed into whatever shape the window has.
+                       Do this before taking screenshots worth keeping:
+                         omavm resolution 1920x1080
+                       The guest takes its mode from the window size once and
+                       never revisits it, so a window that was briefly narrow
+                       leaves it stuck in a portrait mode. The window is left
+                       floating, because only a floating window keeps an
+                       exact size.
 
 Plugin testing:
   plugin <dir>         Install a local plugin directory into the guest:
@@ -796,6 +807,65 @@ cmd_sendkey() {
   echo "Sent: $*"
 }
 
+# Match the guest's resolution to the QEMU window, so it renders pixel for
+# pixel. The guest picks its mode up from the window size at the moment it
+# first detects one and then never revisits it, so a window that was briefly
+# narrow leaves the guest in a portrait mode that gets squeezed into whatever
+# shape the window has afterwards. Everything then looks soft, and a
+# screenshot is worse than soft: it is the wrong aspect ratio.
+cmd_resolution() {
+  require_running
+  local spec="${1:-}" guest_scale="${2:-1}"
+  if [[ ! $spec =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    echo "omavm: usage: omavm resolution <width>x<height> [guest-scale]" >&2
+    echo "e.g. omavm resolution 1920x1080" >&2
+    exit 1
+  fi
+  local width="${BASH_REMATCH[1]}" height="${BASH_REMATCH[2]}"
+
+  if ! command -v hyprctl >/dev/null || ! hyprctl -j monitors >/dev/null 2>&1; then
+    echo "omavm: no Hyprland on this host, so the window cannot be resized." >&2
+    echo "Setting the guest only; size the QEMU window yourself to $((width / guest_scale))x$((height / guest_scale))." >&2
+  fi
+
+  # The guest's output name, rather than assuming Virtual-1.
+  local output
+  output=$(vmssh "$GUEST_ENV hyprctl -j monitors" 2>/dev/null | jq -r '.[0].name // empty')
+  if [[ -z $output ]]; then
+    echo "omavm: no Hyprland session in the guest yet; boot it first." >&2
+    exit 1
+  fi
+
+  echo "Guest $output -> ${width}x${height} @ scale $guest_scale"
+  vmssh "$GUEST_ENV hyprctl eval 'hl.monitor({ output = \"$output\", mode = \"${width}x${height}@60\", position = \"0x0\", scale = $guest_scale })'" >/dev/null
+
+  # Hyprland sizes windows in logical pixels, so a scaled host display needs
+  # the request divided by its scale to land on the physical size we asked the
+  # guest for.
+  local win host_scale logical_w logical_h
+  win=$(hyprctl -j clients 2>/dev/null |
+    jq -r '.[] | select(.class == "qemu-system-x86_64") | .address' | head -1)
+  if [[ -z $win ]]; then
+    echo "omavm: QEMU window not found on this host; guest resized only." >&2
+    return 0
+  fi
+  host_scale=$(hyprctl -j monitors 2>/dev/null | jq -r '.[0].scale // 1')
+  logical_w=$(awk -v w="$width" -v s="$host_scale" 'BEGIN { printf "%d", w / s }')
+  logical_h=$(awk -v h="$height" -v s="$host_scale" 'BEGIN { printf "%d", h / s }')
+
+  # Only a floating window can be given an exact size; a tiled one is owned by
+  # the layout. Float it if it is not already.
+  if [[ $(hyprctl -j clients | jq -r --arg a "$win" '.[] | select(.address == $a) | .floating') != "true" ]]; then
+    hyprctl dispatch "hl.dsp.window.float({ window = \"address:$win\" })" >/dev/null
+    sleep 1
+  fi
+  hyprctl dispatch "hl.dsp.window.resize({ x = $logical_w, y = $logical_h, relative = false, window = \"address:$win\" })" >/dev/null
+  sleep 1
+  hyprctl dispatch "hl.dsp.window.center({ window = \"address:$win\" })" >/dev/null
+  echo "QEMU window -> ${logical_w}x${logical_h} logical (${width}x${height} physical at host scale $host_scale), floating"
+  echo "It is floating now so the size sticks; SUPER+V tiles it back."
+}
+
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   provision) shift; cmd_provision "$@" ;;
@@ -817,6 +887,7 @@ case "${1:-}" in
   hypr) shift; cmd_hypr "$@" ;;
   qs) shift; cmd_qs "$@" ;;
   restart-shell) shift; cmd_restart_shell "$@" ;;
+  resolution) shift; cmd_resolution "$@" ;;
   plugin) shift; cmd_plugin "$@" ;;
   -h | --help | help | "") usage ;;
   *)
