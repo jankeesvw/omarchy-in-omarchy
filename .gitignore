@@ -1,0 +1,7 @@
+# Snapshots are multi-gigabyte disk images: working data, not source.
+vm-saves/
+
+# Local session logs and scratch files.
+*.jsonl
+*.qcow2
+*.fd

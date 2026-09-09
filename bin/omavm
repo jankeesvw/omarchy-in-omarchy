@@ -1,0 +1,827 @@
+#!/bin/bash
+#
+# omavm - drive the disposable Omarchy test VM (QEMU/KVM) from one command.
+#
+# The VM boots from snapshots managed by ~/Documents/omarchy-vm (see the
+# README there). This script wraps booting, SSH, file transfer, screenshots,
+# Hyprland/quickshell access and plugin installs so nothing has to remember
+# the env-var and gum-confirm pitfalls.
+
+set -euo pipefail
+
+VM_DIR="${OMAVM_DIR:-$HOME/Documents/omarchy-vm}"
+VM_BIN="$VM_DIR/bin"
+# The active disk lives on real disk, not /tmp: /tmp is tmpfs, so a multi-GB
+# qcow2 there is held entirely in RAM and starves the host (oom-kills the VM).
+ACTIVE_DISK="${OMARCHY_VM_DISK:-/var/tmp/omarchy-iso-boot.qcow2}"
+OVMF_VARS="${OMARCHY_VM_OVMF_VARS:-/var/tmp/OVMF_VARS.4m.fd}"
+VM_MEM="${OMAVM_MEM:-}" # MB; empty keeps omarchy-iso-boot's default (8192)
+# Let child omarchy-vm/omarchy-iso-boot calls use the same paths we do
+export OMARCHY_VM_DISK="$ACTIVE_DISK" OMARCHY_VM_OVMF_VARS="$OVMF_VARS"
+SSH_PORT="${OMAVM_SSH_PORT:-2222}"
+# QMP control socket. Lets us photograph the guest's screen and press keys in
+# it without touching the host desktop, which matters while the guest has no
+# SSH yet (installing, or stuck on a boot prompt).
+QMP_SOCK="${OMAVM_QMP_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$UID}/omavm-qmp.sock}"
+GUEST_USER="${OMAVM_USER:-$USER}"
+GUEST_UID=1000
+UNIT="omarchy-vm.service"
+SHELL_QML="/usr/share/omarchy/shell/shell.qml"
+
+# Unattended install settings. The guest deliberately has no disk encryption:
+# it is a throwaway machine that must boot straight into Hyprland without
+# anyone typing a passphrase. Nothing secret may live on that disk; secrets
+# reach the guest over a forwarded SSH agent instead (see cmd_agent).
+ISO="${OMAVM_ISO:-$HOME/Downloads/omarchy-4.0.3.iso}"
+GUEST_PASSWORD="${OMAVM_PASSWORD:-omarchy}"
+GUEST_HOSTNAME="${OMAVM_HOSTNAME:-omarchy-vm}"
+GUEST_TIMEZONE="${OMAVM_TIMEZONE:-Europe/Amsterdam}"
+# Git identity for the guest; taken from yours so a fresh VM commits as you.
+GUEST_FULL_NAME="${OMAVM_FULL_NAME:-$(git config --global user.name 2>/dev/null || echo "$USER")}"
+GUEST_EMAIL="${OMAVM_EMAIL:-$(git config --global user.email 2>/dev/null || echo "$USER@localhost")}"
+# The host agent that holds the real keys; forwarded on demand, never copied.
+AGENT_SOCK="${OMAVM_AGENT_SOCK:-$HOME/.1password/agent.sock}"
+# Stow packages installed into the guest. Left out on purpose: "ssh" (its
+# IdentityAgent line would override the forwarded agent), "services" (timers
+# that would start backing up and syncing from a test VM) and the app-specific
+# packages that have nothing to configure there.
+DOTFILES_PACKAGES="${OMAVM_DOTFILES_PACKAGES:-ai hypr omarchy-managed omarchy-overrides personal scripts}"
+DOTFILES_REPO="${OMAVM_DOTFILES_REPO:-$HOME/dotfiles}"
+# The guest gets a clone of your working copy, so point its origin back at
+# wherever yours came from rather than at a path on this machine.
+DOTFILES_ORIGIN="${OMAVM_DOTFILES_ORIGIN:-$(git -C "$DOTFILES_REPO" remote get-url origin 2>/dev/null || true)}"
+
+SSH_OPTS=(-p "$SSH_PORT" -o ConnectTimeout=3 -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR)
+# Session env for tools that need the guest's Wayland/Hyprland session
+GUEST_ENV="export XDG_RUNTIME_DIR=/run/user/$GUEST_UID WAYLAND_DISPLAY=wayland-1 HYPRLAND_INSTANCE_SIGNATURE=\$(ls /run/user/$GUEST_UID/hypr | head -1);"
+
+usage() {
+  cat <<'USAGE'
+omavm - drive the disposable Omarchy test VM
+
+Usage: omavm <command> [args]
+
+Building the machine (rarely; "fresh" is already built):
+  install              Install Omarchy from scratch, unattended, onto a blank
+                       disk. Uses a cidata drive so nothing has to be typed,
+                       and installs WITHOUT disk encryption so the VM boots
+                       straight into Hyprland. Runs provision afterwards.
+                       Save the result with: omavm stop && omavm save fresh
+  provision            Re-run the post-install steps on a running VM: root SSH
+                       key, passwordless sudo, stow, dotfiles.
+  dotfiles             Re-copy the host dotfiles into the guest and stow them.
+
+VM lifecycle:
+  boot [snapshot]      Boot a clean VM from a snapshot (default: fresh).
+                       Discards the current active disk, starts QEMU in a
+                       systemd user unit (survives the calling session) and
+                       waits until SSH answers.
+  resume               Boot again from the existing active disk instead of a
+                       snapshot (continue where a stopped VM left off).
+  stop                 Power the VM off cleanly (SSH poweroff, falls back to
+                       stopping the systemd unit).
+  status               Show unit state, SSH reachability and whether a
+                       Hyprland session is running in the guest.
+
+Snapshots (in ~/Documents/omarchy-vm/vm-saves/):
+  save <name> [--force]
+                       Save the active disk as a snapshot. Refuses while the
+                       VM is running: stop it first for a consistent copy.
+                       Refuses to overwrite an existing snapshot without
+                       --force, so "fresh" cannot go by accident.
+  list                 List available snapshots.
+
+Working in the guest (root over SSH on localhost:2222):
+  ssh [cmd...]         Open a shell in the VM, or run a single command.
+  user <cmd...>        Run a command in the guest as the regular user, with
+                       the Wayland/Hyprland session environment loaded.
+  push <local> [dest]  Copy a file or directory into the VM (default /tmp/).
+  pull <remote> [dest] Copy a file out of the VM (default: current dir).
+  agent [cmd...]       Shell or command as the guest user with your host SSH
+                       agent forwarded, so git and gh reach GitHub with your
+                       real key. The key itself never enters the VM: the guest
+                       can only ask the agent to sign, and only while this
+                       command runs. Needs 1Password unlocked.
+                         omavm agent git -C ~/dotfiles push
+
+Desktop in the guest:
+  shot [file]          Take a screenshot of the guest desktop with grim and
+                       write it to <file> (default: ./vm-shot.png). Needs SSH
+                       and a running Hyprland session in the guest.
+  screendump [file]    Photograph the guest's screen through QEMU itself
+                       (default: ./vm-screen.png). Works without SSH and
+                       without a desktop in the guest, and does not care which
+                       workspace the QEMU window is on. Needs the VM to run
+                       without GPU acceleration, which "install" does by
+                       itself; elsewhere: OMARCHY_VM_GL=0 omavm boot
+  sendkey <key...>     Press keys inside the guest via QEMU, e.g.
+                         omavm sendkey ret
+                         omavm sendkey ctrl-alt-f2
+                       QEMU key names; dashes make a chord. This never touches
+                       the host desktop, so it is safe while you work.
+  hypr <args...>       Run hyprctl in the guest session. Remember: Quattro,
+                       so dispatch takes lua, e.g.
+                         omavm hypr dispatch 'hl.dsp.focus({ workspace = 2 })'
+  qs <args...>         Run quickshell CLI against the running shell, e.g.
+                         omavm qs ipc call your-name.text-transform open
+  restart-shell        Restart omarchy-shell in the guest.
+
+Plugin testing:
+  plugin <dir>         Install a local plugin directory into the guest:
+                       copies it to ~/.config/omarchy/plugins/, registers the
+                       bar widget from manifest.json in shell.json and
+                       restarts the shell. Typical loop:
+                         omavm boot && omavm plugin ~/Documents/OmarchyPlugins/foo && omavm shot
+
+Notes:
+  - The active disk lives in /var/tmp and does not survive a host reboot;
+    snapshots do. "boot" always starts clean, "resume" continues.
+  - The guest has no disk encryption and passwordless sudo, so treat its disk
+    as readable by anyone who gets at it: never put a secret in the VM. Use
+    "omavm agent" when something in there needs one of your keys.
+  - If SSH does not come up after boot, the guest is usually waiting for
+    input in the QEMU window (a login prompt).
+  - The QEMU window: Ctrl-Alt-F toggles QEMU fullscreen, Ctrl-Alt-G
+    releases a grabbed mouse.
+USAGE
+}
+
+vmssh() { ssh "${SSH_OPTS[@]}" root@localhost "$@"; }
+
+unit_active() { systemctl --user is-active --quiet "$UNIT"; }
+
+require_running() {
+  if ! unit_active; then
+    echo "omavm: the VM is not running (start it with: omavm boot)" >&2
+    exit 1
+  fi
+}
+
+wait_for_ssh() {
+  local waited=0 timeout="${1:-180}"
+  echo -n "Waiting for SSH"
+  until vmssh true 2>/dev/null; do
+    sleep 3
+    waited=$((waited + 3))
+    echo -n "."
+    if ((waited >= timeout)); then
+      echo
+      echo "omavm: no SSH after ${timeout}s. The guest is probably waiting for" >&2
+      echo "input in the QEMU window (disk password or login prompt)." >&2
+      exit 1
+    fi
+  done
+  echo " up after ~${waited}s"
+}
+
+cmd_boot() {
+  local snapshot="${1:-fresh}"
+  if unit_active; then
+    echo "omavm: a VM is already running; use it, or 'omavm stop' first." >&2
+    exit 1
+  fi
+  if [[ ! -d "$VM_DIR/vm-saves/$snapshot" ]]; then
+    echo "omavm: snapshot '$snapshot' not found" >&2
+    cmd_list >&2
+    exit 1
+  fi
+  # Copy the snapshot ourselves instead of via omarchy-vm boot: that path
+  # asks a gum confirm over an existing disk, which exits 0 silently without
+  # a tty, and it cannot pass extra QEMU args through cleanly.
+  cp "$VM_DIR/vm-saves/$snapshot/omarchy-iso-boot.qcow2" "$ACTIVE_DISK"
+  cp "$VM_DIR/vm-saves/$snapshot/OVMF_VARS.4m.fd" "$OVMF_VARS"
+  local extra=(-- -qmp "unix:$QMP_SOCK,server=on,wait=off")
+  [[ -n "$VM_MEM" ]] && extra+=(-m "$VM_MEM")
+  rm -f "$QMP_SOCK"
+  systemd-run --user --unit="${UNIT%.service}" --collect \
+    --setenv=OMARCHY_VM_DISK="$ACTIVE_DISK" \
+    --setenv=OMARCHY_VM_OVMF_VARS="$OVMF_VARS" \
+    --setenv=OMARCHY_VM_GL="${OMARCHY_VM_GL:-1}" \
+    "$VM_BIN/omarchy-iso-boot" --reuse /dev/null "${extra[@]}" >/dev/null
+  echo "Booting snapshot '$snapshot'${VM_MEM:+ with ${VM_MEM}MB RAM} (QEMU window appears on the desktop)"
+  wait_for_ssh
+}
+
+cmd_resume() {
+  if unit_active; then
+    echo "omavm: a VM is already running." >&2
+    exit 1
+  fi
+  if [[ ! -f "$ACTIVE_DISK" ]]; then
+    echo "omavm: no active disk at $ACTIVE_DISK; boot a snapshot instead." >&2
+    exit 1
+  fi
+  local extra=(-- -qmp "unix:$QMP_SOCK,server=on,wait=off")
+  [[ -n "$VM_MEM" ]] && extra+=(-m "$VM_MEM")
+  rm -f "$QMP_SOCK"
+  systemd-run --user --unit="${UNIT%.service}" --collect \
+    --setenv=OMARCHY_VM_DISK="$ACTIVE_DISK" \
+    --setenv=OMARCHY_VM_OVMF_VARS="$OVMF_VARS" \
+    --setenv=OMARCHY_VM_GL="${OMARCHY_VM_GL:-1}" \
+    "$VM_BIN/omarchy-iso-boot" --reuse /dev/null "${extra[@]}" >/dev/null
+  echo "Resuming from the existing active disk"
+  wait_for_ssh
+}
+
+cmd_stop() {
+  if ! unit_active; then
+    echo "omavm: the VM is not running."
+    return 0
+  fi
+  vmssh poweroff 2>/dev/null || true
+  local waited=0
+  while unit_active && ((waited < 30)); do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if unit_active; then
+    systemctl --user stop "$UNIT"
+  fi
+  echo "VM stopped"
+}
+
+cmd_status() {
+  if unit_active; then
+    echo "unit:     running ($UNIT)"
+  else
+    echo "unit:     not running"
+  fi
+  if vmssh true 2>/dev/null; then
+    echo "ssh:      reachable (root@localhost:$SSH_PORT)"
+    if vmssh "ls /run/user/$GUEST_UID/hypr >/dev/null 2>&1"; then
+      echo "hyprland: session running"
+    else
+      echo "hyprland: no session (log in via the QEMU window)"
+    fi
+  else
+    echo "ssh:      not reachable"
+  fi
+  [[ -f "$ACTIVE_DISK" ]] && echo "disk:     $ACTIVE_DISK ($(du -h "$ACTIVE_DISK" | cut -f1))"
+}
+
+cmd_save() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "omavm: usage: omavm save <name>" >&2
+    exit 1
+  fi
+  if unit_active; then
+    echo "omavm: the VM is running; a snapshot of a live disk is inconsistent." >&2
+    echo "Stop it first: omavm stop" >&2
+    exit 1
+  fi
+  # Copy it ourselves rather than through omarchy-vm save: over an existing
+  # snapshot that asks a gum confirm, which without a tty dies on /dev/tty
+  # instead of asking. Overwriting is guarded here instead, explicitly.
+  local dest="$VM_DIR/vm-saves/$name"
+  if [[ -d $dest && ${2:-} != "--force" ]]; then
+    echo "omavm: snapshot '$name' already exists." >&2
+    echo "Overwrite it with: omavm save $name --force" >&2
+    exit 1
+  fi
+  mkdir -p "$dest"
+  cp "$ACTIVE_DISK" "$dest/omarchy-iso-boot.qcow2"
+  cp "$OVMF_VARS" "$dest/OVMF_VARS.4m.fd"
+  echo "Saved snapshot '$name' ($(du -h "$dest/omarchy-iso-boot.qcow2" | cut -f1))"
+}
+
+cmd_list() { "$VM_BIN/omarchy-vm" list; }
+
+cmd_ssh() {
+  require_running
+  if (($# == 0)); then
+    # Interactive shell wants a tty and host-key prompts are fine there
+    exec ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost
+  fi
+  vmssh "$@"
+}
+
+cmd_user() {
+  require_running
+  if (($# == 0)); then
+    echo "omavm: usage: omavm user <command...>" >&2
+    exit 1
+  fi
+  # --preserve-environment keeps root's HOME, which makes every ~ in the
+  # command point at /root; -w passes only the session vars we actually want.
+  vmssh "$GUEST_ENV runuser -u $GUEST_USER \
+    -w XDG_RUNTIME_DIR,WAYLAND_DISPLAY,HYPRLAND_INSTANCE_SIGNATURE -- bash -lc $(printf '%q' "$*")"
+}
+
+cmd_push() {
+  require_running
+  local src="${1:-}" dest="${2:-/tmp/}"
+  if [[ -z "$src" ]]; then
+    echo "omavm: usage: omavm push <local-path> [guest-dest]" >&2
+    exit 1
+  fi
+  scp -r -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR "$src" "root@localhost:$dest"
+}
+
+cmd_pull() {
+  require_running
+  local src="${1:-}" dest="${2:-.}"
+  if [[ -z "$src" ]]; then
+    echo "omavm: usage: omavm pull <guest-path> [local-dest]" >&2
+    exit 1
+  fi
+  scp -r -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR "root@localhost:$src" "$dest"
+}
+
+cmd_shot() {
+  require_running
+  local out="${1:-vm-shot.png}"
+  vmssh "$GUEST_ENV grim /tmp/omavm-shot.png"
+  vmssh "cat /tmp/omavm-shot.png" >"$out"
+  vmssh "rm -f /tmp/omavm-shot.png"
+  echo "$out"
+}
+
+cmd_hypr() {
+  require_running
+  local args
+  printf -v args '%q ' "$@"
+  vmssh "$GUEST_ENV hyprctl $args"
+}
+
+cmd_qs() {
+  require_running
+  local args
+  printf -v args '%q ' "$@"
+  vmssh "$GUEST_ENV runuser -u $GUEST_USER --preserve-environment -- qs -p $SHELL_QML $args"
+}
+
+cmd_restart_shell() {
+  require_running
+  vmssh "$GUEST_ENV runuser -u $GUEST_USER --preserve-environment -- omarchy restart shell"
+  echo "Shell restarted"
+}
+
+cmd_plugin() {
+  require_running
+  local dir="${1:-}"
+  if [[ -z "$dir" || ! -f "$dir/manifest.json" ]]; then
+    echo "omavm: usage: omavm plugin <plugin-dir> (must contain manifest.json)" >&2
+    exit 1
+  fi
+  local id name section
+  id=$(jq -r '.id' "$dir/manifest.json")
+  name=$(basename "$dir")
+  section=$(jq -r '.barWidget.defaultSection // "right"' "$dir/manifest.json")
+
+  echo "Installing $name ($id) into the guest"
+  tar -C "$(dirname "$dir")" -czf - --exclude=.git --exclude=screenshots "$name" |
+    vmssh "mkdir -p ~$GUEST_USER/.config/omarchy/plugins &&
+           tar -C ~$GUEST_USER/.config/omarchy/plugins -xzf - &&
+           chown -R $GUEST_USER:$GUEST_USER ~$GUEST_USER/.config/omarchy/plugins"
+
+  # Register the bar widget in shell.json unless it is already there
+  vmssh "cd ~$GUEST_USER/.config/omarchy &&
+    if jq -e '.bar.layout.$section[] | select(.id == \"$id\")' shell.json >/dev/null 2>&1; then
+      echo 'Widget already registered'
+    else
+      jq '.bar.layout.$section = [{\"id\": \"$id\"}] + .bar.layout.$section' shell.json > shell.json.new &&
+      mv shell.json.new shell.json && chown $GUEST_USER:$GUEST_USER shell.json &&
+      echo 'Widget registered in bar ($section section)'
+    fi"
+
+  cmd_restart_shell
+  echo "Done. Check it with: omavm shot"
+}
+
+# Build the cidata drive that turns the ISO's wizard into an unattended
+# install: the installer mounts any drive labelled CIDATA (cloud-init's NoCloud
+# convention) and uses the files on it instead of asking. The layout below is
+# archinstall's own config format; deliberately no "disk_encryption" block, so
+# the installed system boots without a passphrase.
+build_cidata() {
+  local img="$1" dir hash
+  dir=$(mktemp -d)
+
+  hash=$(openssl passwd -6 "$GUEST_PASSWORD")
+
+  local mib=$((1024 * 1024)) gib=$((1024 * 1024 * 1024))
+  local disk_bytes=$((40 * gib))
+  local boot_start=$mib boot_size=$((2 * gib))
+  local main_start=$((boot_size + boot_start))
+  local main_size=$((disk_bytes - main_start - mib)) # minus the GPT backup reserve
+
+  cat >"$dir/user_credentials.json" <<EOF
+{
+    "root_enc_password": $(jq -Rn --arg v "$hash" '$v'),
+    "users": [
+        {
+            "enc_password": $(jq -Rn --arg v "$hash" '$v'),
+            "groups": [],
+            "sudo": true,
+            "username": "$GUEST_USER"
+        }
+    ]
+}
+EOF
+
+  cat >"$dir/user_configuration.json" <<EOF
+{
+    "app_config": null,
+    "archinstall-language": "English",
+    "auth_config": {},
+    "audio_config": { "audio": "pipewire" },
+    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
+    "custom_commands": [],
+    "omarchy_install": {
+        "mode": "full_disk",
+        "defer_provisioning": false,
+        "target_mount": "/mnt",
+        "boot": {
+            "esp_mount": "/boot",
+            "esp_path": "/EFI/limine",
+            "efi_binary": "limine_x64.efi",
+            "enable_fallback": true
+        },
+        "storage": { "kernel": "linux" }
+    },
+    "disk_config": {
+        "config_type": "default_layout",
+        "device_modifications": [
+            {
+                "device": "/dev/vda",
+                "partitions": [
+                    {
+                        "btrfs": [],
+                        "dev_path": null,
+                        "flags": [ "boot", "esp" ],
+                        "fs_type": "fat32",
+                        "mount_options": [],
+                        "mountpoint": "/boot",
+                        "obj_id": "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d",
+                        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_size },
+                        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_start },
+                        "status": "create",
+                        "type": "primary"
+                    },
+                    {
+                        "btrfs": [
+                            { "mountpoint": "/", "name": "@" },
+                            { "mountpoint": "/home", "name": "@home" },
+                            { "mountpoint": "/var/log", "name": "@log" },
+                            { "mountpoint": "/var/cache/pacman/pkg", "name": "@pkg" }
+                        ],
+                        "dev_path": null,
+                        "flags": [],
+                        "fs_type": "btrfs",
+                        "mount_options": [ "compress=zstd" ],
+                        "mountpoint": null,
+                        "obj_id": "8c2c2b92-1070-455d-b76a-56263bab24aa",
+                        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_size },
+                        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_start },
+                        "status": "create",
+                        "type": "primary"
+                    }
+                ],
+                "wipe": true
+            }
+        ]
+    },
+    "hostname": "$GUEST_HOSTNAME",
+    "kernels": [ "linux" ],
+    "network_config": { "type": "iso" },
+    "ntp": true,
+    "parallel_downloads": 8,
+    "script": null,
+    "services": [],
+    "swap": true,
+    "timezone": "$GUEST_TIMEZONE",
+    "locale_config": { "kb_layout": "us", "sys_enc": "UTF-8", "sys_lang": "en_US.UTF-8" },
+    "mirror_config": {
+        "custom_repositories": [],
+        "custom_servers": [
+            {"url": "https://mirror.omarchy.org/\$repo/os/\$arch"},
+            {"url": "https://mirror.rackspace.com/archlinux/\$repo/os/\$arch"},
+            {"url": "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"}
+        ],
+        "mirror_regions": {},
+        "optional_repositories": []
+    },
+    "packages": [
+        "base-devel",
+        "git",
+        "omarchy-keyring",
+        "omarchy-settings",
+        "omarchy"
+    ],
+    "profile_config": { "gfx_driver": null, "greeter": null, "profile": {} },
+    "version": "3.0.9"
+}
+EOF
+
+  echo "$GUEST_FULL_NAME" >"$dir/user_full_name.txt"
+  echo "$GUEST_EMAIL" >"$dir/user_email_address.txt"
+  echo "false" >"$dir/user_encrypt_installation.txt"
+  # Gets installed as the guest user's authorized_keys, and enables sshd plus a
+  # ufw rule for it; without this the installed system is unreachable.
+  cat "$HOME/.ssh/id_ed25519.pub" >"$dir/authorized_keys"
+
+  rm -f "$img"
+  truncate -s 4M "$img"
+  mkfs.vfat -n CIDATA "$img" >/dev/null
+  mcopy -i "$img" "$dir"/* ::/
+  rm -rf "$dir"
+}
+
+cmd_install() {
+  if unit_active; then
+    echo "omavm: a VM is already running; stop it first (omavm stop)." >&2
+    exit 1
+  fi
+  if [[ ! -f "$ISO" ]]; then
+    echo "omavm: ISO not found at $ISO" >&2
+    echo "Download one from https://iso.omarchy.org/ or set OMAVM_ISO." >&2
+    exit 1
+  fi
+  for tool in mkfs.vfat mcopy jq openssl; do
+    if ! command -v "$tool" >/dev/null; then
+      echo "omavm: '$tool' is missing (mcopy comes from the mtools package)." >&2
+      exit 1
+    fi
+  done
+
+  local cidata="/var/tmp/omavm-cidata.img"
+  echo "Building the cidata drive (unattended, no disk encryption)"
+  build_cidata "$cidata"
+
+  echo "Creating a blank 40G disk and booting $(basename "$ISO")"
+  rm -f "$QMP_SOCK"
+  rm -f "$ACTIVE_DISK"
+  qemu-img create -f qcow2 "$ACTIVE_DISK" 40G >/dev/null
+  cp /usr/share/edk2/x64/OVMF_VARS.4m.fd "$OVMF_VARS"
+
+  # The blank disk is bootindex=1 and falls through to the ISO; once installed
+  # the same disk boots the real system, so no boot-order change is needed.
+  # No GL during the install: the installer needs no GPU, and without it QEMU
+  # keeps a framebuffer, so "omavm screendump" can show how far it has got.
+  # That matters here because there is no SSH to ask until the very end.
+  systemd-run --user --unit="${UNIT%.service}" --collect \
+    --setenv=OMARCHY_VM_DISK="$ACTIVE_DISK" \
+    --setenv=OMARCHY_VM_OVMF_VARS="$OVMF_VARS" \
+    --setenv=OMARCHY_VM_GL=0 \
+    "$VM_BIN/omarchy-iso-boot" --reuse "$ISO" \
+    -- -drive "file=$cidata,format=raw,if=none,id=cidata" \
+    -device usb-storage,drive=cidata \
+    -qmp "unix:$QMP_SOCK,server=on,wait=off" >/dev/null
+
+  echo "Installing. This takes 15-30 minutes; the QEMU window shows progress."
+  echo "The guest reboots into the installed system on its own, and SSH"
+  echo "answering is how we know it got there."
+  wait_for_ssh_as_user 3600
+
+  cmd_provision
+  echo
+  echo "Done. Save it as the clean snapshot with:"
+  echo "  omavm stop && omavm save fresh"
+}
+
+# The install puts our key on the guest user, not root, so first contact is as
+# the user; cmd_provision then opens the root path the rest of omavm uses.
+usermssh() {
+  ssh "${SSH_OPTS[@]}" "$GUEST_USER@localhost" "$@"
+}
+
+wait_for_ssh_as_user() {
+  local waited=0 timeout="${1:-180}"
+  echo -n "Waiting for the installed system"
+  until usermssh true 2>/dev/null; do
+    sleep 10
+    waited=$((waited + 10))
+    ((waited % 60 == 0)) && echo -n " ${waited}s"
+    echo -n "."
+    if ((waited >= timeout)); then
+      echo
+      echo "omavm: still no SSH after ${timeout}s. Check the QEMU window: the" >&2
+      echo "install may have stopped on a prompt." >&2
+      exit 1
+    fi
+  done
+  echo " up after ~${waited}s"
+}
+
+# Everything that turns a stock install into the test machine we want. Split
+# out from cmd_install so it can be re-run against an existing VM.
+cmd_provision() {
+  require_running
+  local key
+  key=$(cat "$HOME/.ssh/id_ed25519.pub")
+
+  # One sudo for the whole lot. Piping the password in as the first line and
+  # the script after it means sudo consumes the line it wants and bash reads
+  # the rest, so this needs neither a tty nor a second authentication.
+  #
+  # Passwordless sudo afterwards: on a machine that already boots unattended
+  # and hands out root over SSH, a sudo password guards nothing and only gets
+  # in the way of scripts. NOPASSWD alone is not enough: the stock install also
+  # writes a plain "ALL" rule, and against that "sudo -v" still demands a
+  # password. omarchy-update runs exactly that, so it would stop and ask on a
+  # machine meant to need no typing. !authenticate covers the validation too.
+  echo "Opening the root SSH path and enabling passwordless sudo"
+  {
+    echo "$GUEST_PASSWORD"
+    cat <<PROVISION
+set -e
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+printf '%s\n' '$key' > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+printf '%s\n' 'Defaults:$GUEST_USER !authenticate' '$GUEST_USER ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-omavm
+chmod 440 /etc/sudoers.d/99-omavm
+visudo -c > /dev/null
+PROVISION
+  } | usermssh "sudo -S -p '' bash -s"
+
+  # Without disk encryption the installer sets up no SDDM autologin, so the
+  # machine still stops at a login prompt. That would defeat the point: this VM
+  # has to come up ready to use without anyone typing anything.
+  echo "Enabling SDDM autologin for $GUEST_USER"
+  vmssh "cat > /etc/sddm.conf.d/99-omavm-autologin.conf <<EOF
+[Autologin]
+User=$GUEST_USER
+Session=hyprland-uwsm.desktop
+Relogin=true
+EOF"
+
+  # A fresh install has empty package databases: everything came from the
+  # mirror bundled on the ISO, so pacman has never synced. Without -Sy the
+  # install below fails with "target not found".
+  # A test VM should never dim, lock or start a screensaver: that costs a
+  # password prompt on a machine meant to need none, and a blanked screen also
+  # hangs the grim screenshot in "omavm shot". Both toggles take an explicit
+  # value, so re-running provision cannot flip them back off.
+  echo "Disabling the screensaver and keeping the screen awake"
+  vmssh "runuser -u $GUEST_USER -- bash -lc '
+    omarchy-toggle screensaver-off on
+    omarchy-toggle-idle stay-awake >/dev/null'" ||
+    echo "omavm: could not set the idle toggles (old Omarchy?)" >&2
+
+  echo "Syncing package databases and installing stow"
+  if ! vmssh "pacman -Sy --noconfirm >/dev/null 2>&1 && \
+              pacman -S --needed --noconfirm stow >/dev/null 2>&1"; then
+    echo "omavm: could not install stow in the guest; dotfiles stay unstowed." >&2
+    return 1
+  fi
+
+  cmd_dotfiles
+}
+
+# Ship the dotfiles as a git clone of the host's working repo: a clone carries
+# only tracked files, so the ignored private keys stay on the host. The origin
+# is then pointed back at GitHub, reachable through a forwarded agent.
+cmd_dotfiles() {
+  require_running
+  if [[ ! -d "$DOTFILES_REPO/.git" ]]; then
+    echo "omavm: no git repo at $DOTFILES_REPO" >&2
+    exit 1
+  fi
+  local staging
+  staging=$(mktemp -d)
+
+  echo "Cloning the dotfiles into the guest (tracked files only)"
+  git clone --quiet --no-hardlinks "$DOTFILES_REPO" "$staging/dotfiles"
+  git -C "$staging/dotfiles" remote set-url origin "$DOTFILES_ORIGIN"
+
+  tar -C "$staging" -czf - dotfiles |
+    vmssh "rm -rf ~$GUEST_USER/dotfiles && tar -C ~$GUEST_USER -xzf - && \
+           chown -R $GUEST_USER:$GUEST_USER ~$GUEST_USER/dotfiles"
+  rm -rf "$staging"
+
+  # A stock Omarchy already ships files where the dotfiles want to put links
+  # (nvim config, starship.toml), so a plain stow aborts on every one of them.
+  # --adopt pulls those files into the repo and links them, which would leave
+  # the repo holding Omarchy's defaults instead of ours; the checkout right
+  # after throws that content away again. The links stay, the repo wins. Safe
+  # here precisely because this is a throwaway clone with nothing local in it.
+  echo "Stowing: $DOTFILES_PACKAGES"
+  if vmssh "runuser -u $GUEST_USER -- bash -lc 'cd ~/dotfiles && \
+              stow --adopt -t ~ $DOTFILES_PACKAGES && git checkout -- .'"; then
+    echo "Dotfiles stowed"
+  else
+    echo "omavm: stow failed; look around with: omavm ssh" >&2
+    return 1
+  fi
+}
+
+# Run something in the guest with the host's SSH agent forwarded. The keys stay
+# on the host: the guest can ask the agent to sign, never to hand over a key,
+# and the moment this command returns that access is gone again. That is what
+# keeps GitHub reachable from a VM whose disk has no encryption.
+cmd_agent() {
+  require_running
+  if [[ ! -S "$AGENT_SOCK" ]]; then
+    echo "omavm: no SSH agent socket at $AGENT_SOCK" >&2
+    echo "Open 1Password (it provides the agent) or set OMAVM_AGENT_SOCK." >&2
+    exit 1
+  fi
+  if ! SSH_AUTH_SOCK="$AGENT_SOCK" ssh-add -l >/dev/null 2>&1; then
+    echo "omavm: the agent at $AGENT_SOCK holds no keys or refuses connections." >&2
+    echo "Unlock 1Password and try again." >&2
+    exit 1
+  fi
+  local opts=(-p "$SSH_PORT" -A -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+  if (($# == 0)); then
+    SSH_AUTH_SOCK="$AGENT_SOCK" exec ssh "${opts[@]}" "$GUEST_USER@localhost"
+  fi
+  SSH_AUTH_SOCK="$AGENT_SOCK" ssh "${opts[@]}" "$GUEST_USER@localhost" "$@"
+}
+
+# Talk to QEMU's QMP socket: send each JSON command on its own line and print
+# the replies. QMP needs a capabilities handshake before it accepts anything.
+qmp() {
+  if [[ ! -S "$QMP_SOCK" ]]; then
+    echo "omavm: no QMP socket at $QMP_SOCK." >&2
+    echo "It is created by boot/resume/install; a VM started another way lacks it." >&2
+    exit 1
+  fi
+  local cmds=("$@")
+  {
+    printf '%s\n' '{"execute":"qmp_capabilities"}'
+    printf '%s\n' "${cmds[@]}"
+    # QEMU answers asynchronously, so hold the socket open briefly.
+    sleep 1
+  } | socat - "UNIX-CONNECT:$QMP_SOCK" 2>/dev/null
+}
+
+# Photograph the guest's screen through QEMU itself. Unlike "shot" this needs
+# no SSH and no Wayland session in the guest, and unlike grabbing the QEMU
+# window it does not care which workspace that window is on or whether it is
+# visible at all. This is the way to see an install, a boot prompt or a crash.
+cmd_screendump() {
+  require_running
+  local out="${1:-vm-screen.png}" ppm
+  ppm=$(mktemp --suffix=.ppm)
+  # QEMU writes the file itself, so it must be a path QEMU can reach; it runs
+  # as us, so a temp file is fine.
+  qmp "$(jq -cn --arg f "$ppm" '{execute:"screendump",arguments:{filename:$f}}')" >/dev/null
+  if [[ ! -s "$ppm" ]]; then
+    rm -f "$ppm"
+    echo "omavm: QEMU has no framebuffer to photograph." >&2
+    echo "A normal boot runs with GPU acceleration, and then only the guest" >&2
+    echo "itself can see its screen: use 'omavm shot' over SSH instead. To get" >&2
+    echo "a screendump anyway, boot with GL off:" >&2
+    echo "  OMARCHY_VM_GL=0 omavm boot" >&2
+    exit 1
+  fi
+  magick "$ppm" "$out"
+  rm -f "$ppm"
+  echo "$out"
+}
+
+# Press keys inside the guest through QEMU's own input layer. This is not
+# synthetic input on the host: nothing is typed into the host's compositor and
+# no window has to be focused, so it cannot disturb whatever Jankees is doing.
+# Key names are QEMU's (ret, esc, spc, up, down, a-z, 0-9), and a
+# dash-separated combination is sent as a chord: omavm sendkey ctrl-alt-f2
+cmd_sendkey() {
+  require_running
+  if (($# == 0)); then
+    echo "omavm: usage: omavm sendkey <key> [key...]   (e.g. ret, ctrl-alt-f2)" >&2
+    exit 1
+  fi
+  local key
+  for key in "$@"; do
+    qmp "$(jq -cn --arg k "$key" '
+      {execute:"send-key",arguments:{keys:[$k|split("-")[]|{type:"qcode",data:.}]}}')" >/dev/null
+    sleep 0.2
+  done
+  echo "Sent: $*"
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  provision) shift; cmd_provision "$@" ;;
+  dotfiles) shift; cmd_dotfiles "$@" ;;
+  agent) shift; cmd_agent "$@" ;;
+  boot) shift; cmd_boot "$@" ;;
+  resume) shift; cmd_resume "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  save) shift; cmd_save "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  ssh) shift; cmd_ssh "$@" ;;
+  user) shift; cmd_user "$@" ;;
+  push) shift; cmd_push "$@" ;;
+  pull) shift; cmd_pull "$@" ;;
+  shot) shift; cmd_shot "$@" ;;
+  screendump) shift; cmd_screendump "$@" ;;
+  sendkey) shift; cmd_sendkey "$@" ;;
+  hypr) shift; cmd_hypr "$@" ;;
+  qs) shift; cmd_qs "$@" ;;
+  restart-shell) shift; cmd_restart_shell "$@" ;;
+  plugin) shift; cmd_plugin "$@" ;;
+  -h | --help | help | "") usage ;;
+  *)
+    echo "omavm: unknown command '$1'" >&2
+    echo "Run 'omavm --help' for usage." >&2
+    exit 1
+    ;;
+esac

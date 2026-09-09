@@ -1,0 +1,164 @@
+#!/bin/bash
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VM_DIR="$(dirname "$SCRIPT_DIR")/vm-saves"
+TMP_DISK="${OMARCHY_VM_DISK:-/tmp/omarchy-iso-boot.qcow2}"
+TMP_OVMF="${OMARCHY_VM_OVMF_VARS:-/tmp/OVMF_VARS.4m.fd}"
+
+mkdir -p "$VM_DIR"
+
+save_vm() {
+  local name="$1"
+
+  if [[ -z "$name" ]]; then
+    name=$(gum input --placeholder "Enter VM snapshot name")
+    [[ -z "$name" ]] && exit 1
+  fi
+
+  if [[ ! -f "$TMP_DISK" || ! -f "$TMP_OVMF" ]]; then
+    echo "Error: No active VM found at $TMP_DISK / $TMP_OVMF"
+    echo "Boot a VM first with: omarchy-iso-boot [iso]"
+    exit 1
+  fi
+
+  local vm_path="$VM_DIR/$name"
+
+  if [[ -d "$vm_path" ]]; then
+    if ! gum confirm "VM '$name' exists. Overwrite?"; then
+      exit 0
+    fi
+  fi
+
+  mkdir -p "$vm_path"
+
+  echo "Saving VM snapshot '$name'..."
+  cp "$TMP_DISK" "$vm_path/omarchy-iso-boot.qcow2"
+  cp "$TMP_OVMF" "$vm_path/OVMF_VARS.4m.fd"
+
+  gum style --foreground 212 "✓ Saved to $vm_path"
+}
+
+list_vms() {
+  if [[ ! -d "$VM_DIR" ]] || [[ -z "$(ls -A "$VM_DIR")" ]]; then
+    echo "No VM snapshots found"
+    return 1
+  fi
+
+  echo "Available VM snapshots:"
+  for vm in "$VM_DIR"/*; do
+    [[ -d "$vm" ]] && echo "  • $(basename "$vm")"
+  done
+}
+
+boot_vm() {
+  local name=""
+  local boot_args=()
+  local active_disk="$TMP_DISK"
+  local active_ovmf="$TMP_OVMF"
+
+  if [[ $# -gt 0 && ${1:-} != --* ]]; then
+    name="$1"
+    shift
+  fi
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --disk)
+        active_disk="${2:-}"
+        boot_args+=("$1" "${2:-}")
+        shift 2
+        ;;
+      --disk=*)
+        active_disk="${1#*=}"
+        boot_args+=("$1")
+        shift
+        ;;
+      --ovmf-vars)
+        active_ovmf="${2:-}"
+        boot_args+=("$1" "${2:-}")
+        shift 2
+        ;;
+      --ovmf-vars=*)
+        active_ovmf="${1#*=}"
+        boot_args+=("$1")
+        shift
+        ;;
+      *)
+        boot_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$(ls -A "$VM_DIR" 2>/dev/null)" ]]; then
+    echo "No VM snapshots available"
+    exit 1
+  fi
+
+  if [[ -z "$name" ]]; then
+    name=$(ls -1 "$VM_DIR" | gum choose --header "Select VM to boot:")
+    [[ -z "$name" ]] && exit 0
+  fi
+
+  local vm_path="$VM_DIR/$name"
+
+  if [[ ! -d "$vm_path" ]]; then
+    echo "Error: VM '$name' not found"
+    list_vms
+    exit 1
+  fi
+
+  if [[ -z $active_disk || -z $active_ovmf ]]; then
+    echo "Error: active disk and OVMF vars paths must not be empty"
+    exit 1
+  fi
+
+  if [[ -f $active_disk ]] && ! gum confirm "Override existing active VM disk at $active_disk?"; then
+    exit 0
+  fi
+
+  echo "Copying VM '$name' to $active_disk..."
+  mkdir -p "$(dirname "$active_disk")" "$(dirname "$active_ovmf")"
+  cp "$vm_path/omarchy-iso-boot.qcow2" "$active_disk"
+  cp "$vm_path/OVMF_VARS.4m.fd" "$active_ovmf"
+
+  gum style --foreground 212 "✓ VM ready. Booting..."
+
+  exec "$SCRIPT_DIR/omarchy-iso-boot" "${boot_args[@]}" /dev/null reuse
+}
+
+command="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+case "$command" in
+  save)
+    save_vm "${1:-}"
+    ;;
+  boot)
+    boot_vm "$@"
+    ;;
+  list)
+    list_vms
+    ;;
+  *)
+    gum style --border rounded --padding "0 1" --border-foreground 212 \
+      "$(gum style --bold 'omarchy-vm') - VM snapshot manager" \
+      "" \
+      "$(gum style --foreground 245 'Commands:')" \
+      "  save [name]                 Save current active VM" \
+      "  boot [name] [boot-options]  Boot saved VM (interactive if no name)" \
+      "  list                        List available VMs" \
+      "" \
+      "$(gum style --foreground 245 'Boot options:')" \
+      "  --ssh-port PORT   Forward host PORT to guest SSH (default: 2222)" \
+      "  --ssh-host HOST   Host address for SSH forwarding (default: 127.0.0.1)" \
+      "  --disk PATH       Active disk path, useful for parallel VMs" \
+      "  --ovmf-vars PATH  Active OVMF vars path, useful for parallel VMs" \
+      "  --no-network      Boot without a virtual NIC" \
+      "" \
+      "$(gum style --foreground 245 'Current VMs:')"
+    list_vms 2>/dev/null || echo "  None"
+    ;;
+esac
