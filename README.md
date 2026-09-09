@@ -2,6 +2,8 @@
 
 A disposable [Omarchy](https://omarchy.org) machine running in QEMU/KVM on your Omarchy desktop, for testing plugins, themes and system changes without touching the machine you actually work on. Everything in it may break: the `fresh` snapshot stays clean and a new VM is one command.
 
+![A floating window on the Omarchy desktop showing another Omarchy running under KVM/QEMU](docs/social-preview.png)
+
 The interesting part is that the guest installs itself and boots straight into Hyprland with nothing to type. No installer wizard, no disk passphrase, no login prompt. That takes a few deliberate choices, and the ones that are not obvious are written down below.
 
 ```bash
