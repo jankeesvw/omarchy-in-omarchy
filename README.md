@@ -113,4 +113,8 @@ ln -s ~/Documents/omarchy-vm/skill ~/.claude/skills/vm
 
 `bin/omarchy-iso-boot` and `bin/omarchy-vm` come from [omacom-io/omarchy-iso](https://github.com/omacom-io/omarchy-iso) and carry small local patches: an `OMARCHY_VM_GL=0` switch to trade GPU acceleration for a readable framebuffer, and a path fix so `omarchy-vm` calls its neighbour rather than searching `PATH`. `bin/omavm` is the wrapper around them.
 
-The idea of running Omarchy in a VM this way came from DHH.
+This whole thing started with [DHH answering a question about it](https://x.com/dhh/status/2094856301662835158) on 1 September 2026:
+
+> You can use QEMU. Talk to your agent about it 😄. Tell it to look at omarchy-iso-boot in omacom/omarchy-iso.
+
+So that is what happened, and this repository is where that conversation ended up.
