@@ -108,7 +108,8 @@ Run `omavm --help` for the full reference.
 `skill/SKILL.md` is an [agent skill](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview) describing this setup, so Claude Code, Codex or another CLI agent can drive the VM without rediscovering the pitfalls above. Point your agent's skills directory at it:
 
 ```bash
-ln -s ~/Documents/omarchy-vm/skill ~/.claude/skills/vm
+# from the root of this repository
+ln -s "$PWD/skill" ~/.claude/skills/vm
 ```
 
 ## Credits

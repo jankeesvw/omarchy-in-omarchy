@@ -2,14 +2,16 @@
 #
 # omavm - drive the disposable Omarchy test VM (QEMU/KVM) from one command.
 #
-# The VM boots from snapshots managed by ~/Documents/omarchy-vm (see the
-# README there). This script wraps booting, SSH, file transfer, screenshots,
-# Hyprland/quickshell access and plugin installs so nothing has to remember
-# the env-var and gum-confirm pitfalls.
+# The VM boots from snapshots in vm-saves/ in this repository, found next to
+# this script's own bin/ directory (see the README). This script wraps
+# booting, SSH, file transfer, screenshots, Hyprland/quickshell access and
+# plugin installs so nothing has to remember the env-var and gum-confirm
+# pitfalls.
 
 set -euo pipefail
 
-VM_DIR="${OMAVM_DIR:-$HOME/Documents/omarchy-vm}"
+# Resolved from the script itself, so the repository works wherever it is cloned
+VM_DIR="${OMAVM_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 VM_BIN="$VM_DIR/bin"
 # The active disk lives on real disk, not /tmp: /tmp is tmpfs, so a multi-GB
 # qcow2 there is held entirely in RAM and starves the host (oom-kills the VM).
@@ -84,7 +86,7 @@ VM lifecycle:
   status               Show unit state, SSH reachability and whether a
                        Hyprland session is running in the guest.
 
-Snapshots (in ~/Documents/omarchy-vm/vm-saves/):
+Snapshots (in vm-saves/ in the omavm repository):
   save <name> [--force]
                        Save the active disk as a snapshot. Refuses while the
                        VM is running: stop it first for a consistent copy.
