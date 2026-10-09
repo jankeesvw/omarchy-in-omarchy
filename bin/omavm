@@ -494,9 +494,16 @@ cmd_pull() {
 cmd_shot() {
   require_running
   local out="${1:-vm-shot.png}"
-  vmssh "$GUEST_ENV grim /tmp/omavm-shot.png"
-  vmssh "cat /tmp/omavm-shot.png" >"$out"
-  vmssh "rm -f /tmp/omavm-shot.png"
+  # grim waits for ever for a frame that never comes (a Hyprland that hangs, a
+  # screen that went to sleep), so it gets a deadline. The PNG comes back over
+  # the same call and lands next to the target first, so a shot that fails
+  # halfway never replaces the previous one.
+  if ! vmssh "$GUEST_ENV timeout 20 grim -" >"$out.part" || [[ ! -s $out.part ]]; then
+    rm -f "$out.part"
+    echo "omavm: grim got no frame within 20s; see the screen with omavm screendump" >&2
+    exit 1
+  fi
+  mv -f "$out.part" "$out"
   echo "$out"
 }
 
