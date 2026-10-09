@@ -61,8 +61,14 @@ DOTFILES_ORIGIN="${OMAVM_DOTFILES_ORIGIN:-$(git -C "$DOTFILES_REPO" remote get-u
 # address comes from DHCP, so pinning either would only produce warnings.
 SSH_OPTS=(-o ConnectTimeout=3 -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR)
-# Session env for tools that need the guest's Wayland/Hyprland session
-GUEST_ENV="export XDG_RUNTIME_DIR=/run/user/$GUEST_UID WAYLAND_DISPLAY=wayland-1 HYPRLAND_INSTANCE_SIGNATURE=\$(ls /run/user/$GUEST_UID/hypr | head -1);"
+# Session env for tools that need the guest's Wayland/Hyprland session, read
+# from the user's systemd manager, which the session imports its environment
+# into. Guessing it goes wrong: a Hyprland that crashed or was restarted
+# leaves its old instance dir in /run/user/<uid>/hypr, and those names sort
+# oldest first.
+GUEST_ENV="export XDG_RUNTIME_DIR=/run/user/$GUEST_UID; eval \"\$(runuser -u $GUEST_USER -- \
+systemctl --user show-environment 2>/dev/null | sed -n -E \
+'s/^(WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|DBUS_SESSION_BUS_ADDRESS)=/export &/p')\";"
 
 usage() {
   cat <<'USAGE'
